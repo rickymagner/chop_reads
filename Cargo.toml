@@ -1,0 +1,16 @@
+[package]
+name = "chop_reads"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.5.4", features = ["derive"] }
+rust-htslib = "0.46.0"
+
+[lib]
+name = "chop_reads"
+path = "src/lib.rs"
+
+[[bin]]
+name = "chop-reads"
+path = "src/main.rs"
