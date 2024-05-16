@@ -27,16 +27,16 @@ struct Cli {
 
     /// Length of chunks to split records into
     #[arg(short='s', long)]
-    chunk_size: usize,
+    chunk_size: u32,
 
-    /// Toggle whether to include leftover edges when chunk size doesn't divide record size evenly
-    #[arg(long, default_value_t=true)]
-    include_edges: bool,
+    /// Min record length to include in chopped outputs when handling final chunk
+    #[arg(long, default_value_t=0)]
+    min_length: u32,
 
     /// Toggle whether to skip softclipped bases at edges of record
     /// WARNING: not implemented yet
     #[arg(long, default_value_t=true)]
-    skip_softclips: bool,
+    skip_clipped_bases: bool,
 
     /// Read group value to use for new split records
     #[arg(short='g', long)]
@@ -67,7 +67,7 @@ fn main() {
 
     let mut hts_writer = hts_bam::Writer::from_path(args.output, &header, Format::Bam).unwrap();
 
-    let alignment_chopper = AlignmentChopper::new(args.chunk_size, args.include_edges, args.skip_softclips, args.read_group);
+    let mut alignment_chopper = AlignmentChopper::new(args.chunk_size, args.min_length, args.skip_clipped_bases, args.read_group);
 
     let mut record = hts_bam::Record::new();
     while let Some(r) = hts_reader.read(&mut record) {
