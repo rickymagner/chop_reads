@@ -69,6 +69,10 @@ fn main() {
 
     let mut alignment_chopper = AlignmentChopper::new(args.chunk_size, args.min_length, args.skip_clipped_bases, args.read_group);
 
+    // for rec in hts_reader.records() {
+    //
+    // }
+
     let mut record = hts_bam::Record::new();
     while let Some(r) = hts_reader.read(&mut record) {
         r.expect("Failed to parse record");

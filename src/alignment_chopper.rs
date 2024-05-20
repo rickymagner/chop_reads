@@ -2,13 +2,14 @@ use std::cmp::min;
 use rust_htslib::bam::{Record};
 use rust_htslib::bam::record::{CigarString, Cigar, Aux};
 
+#[derive(Debug)]
 pub struct AlignmentChopper {
     chunk_size: u32,
     min_length: u32,
     skip_clipped_bases: bool,
     read_group: Option<String>,
-    cigar_buffer: Option<Cigar>,
     rec_pieces_buffer: Vec<Record>,
+    record_slice_meta_buffer: RecordSliceMetaBuffer,
 }
 
 #[derive(Debug)]
@@ -30,6 +31,30 @@ impl SplitCigarBuf {
     }
 }
 
+// A struct to hold metadata about current record slicing process
+#[derive(Debug)]
+struct RecordSliceMetaBuffer {
+    global_ref_offset: i64,
+    global_query_offset: usize,
+    cigar_string: CigarString,
+}
+
+impl RecordSliceMetaBuffer {
+    fn new() -> Self {
+        Self {
+            global_ref_offset: 0,
+            global_query_offset: 0,
+            cigar_string: CigarString(Vec::new()),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.global_ref_offset = 0;
+        self.global_query_offset = 0;
+        self.cigar_string.clear();
+    }
+}
+
 impl AlignmentChopper {
     pub fn new(chunk_size: u32, min_length: u32, skip_clipped_bases: bool, read_group: Option<String>) -> Self {
         Self {
@@ -37,26 +62,25 @@ impl AlignmentChopper {
             min_length,
             skip_clipped_bases,
             read_group,
-            cigar_buffer: None,
-            rec_pieces_buffer: Vec::new()
+            rec_pieces_buffer: Vec::new(),
+            record_slice_meta_buffer: RecordSliceMetaBuffer::new()
         }
     }
 
     fn reset(&mut self) {
         // Reset internal buffers for new Record
-        self.cigar_buffer = None;
         self.rec_pieces_buffer.clear();
+        self.record_slice_meta_buffer.reset();
     }
 
-    fn add_chunk_record(&mut self, original_rec: &Record, new_cigar: &CigarString, ref_offset: i64, query_offset: usize, trailing_clipped_bases: u32, last: bool) {
+    fn add_chunk_record(&mut self, original_rec: &Record, local_query_consumed: usize) {
         let mut new_rec = Record::default();
 
         // Get seq and qual slices
+        let query_offset = self.record_slice_meta_buffer.global_query_offset;
         let chunk_num = self.rec_pieces_buffer.len();
-        let mut slice_end = min(original_rec.seq_len(), query_offset + self.chunk_size as usize);
-        if last {
-            slice_end -= trailing_clipped_bases as usize;
-        }
+        let slice_end = min(original_rec.seq_len(), query_offset + local_query_consumed);
+
         let new_seq = &original_rec.seq().as_bytes()[query_offset..slice_end];
         let new_qual = &original_rec.qual()[query_offset..slice_end];
 
@@ -64,8 +88,8 @@ impl AlignmentChopper {
         let new_qname = &[original_rec.qname(), b"-", chunk_num.to_string().as_bytes()].concat();
 
         // These are changed based on the particular slice
-        new_rec.set(new_qname, Some(&new_cigar), new_seq, new_qual);
-        new_rec.set_pos(original_rec.pos() + ref_offset);
+        new_rec.set(new_qname, Some(&self.record_slice_meta_buffer.cigar_string), new_seq, new_qual);
+        new_rec.set_pos(original_rec.pos() + self.record_slice_meta_buffer.global_ref_offset);
 
         // Following are unchanged
         new_rec.set_flags(original_rec.flags());
@@ -146,10 +170,6 @@ impl AlignmentChopper {
     pub fn chop_read(&mut self, rec: &Record) -> &Vec<Record> {
         self.reset();  // Clear internal buffers
 
-        let mut global_ref_offset = 0;
-        let mut global_query_offset = 0;
-        let mut cigar_string: CigarString = CigarString(Vec::new());
-
         let mut local_ref_consumed = 0;
         let mut local_query_consumed = 0;
 
@@ -157,71 +177,34 @@ impl AlignmentChopper {
 
         let mut current_cigar = rec.cigar().take();
 
-        // If skipping clipped bases, trim from end of Cigar
-        let mut trailing_clipped_bases = 0;
-        while let Some(c) = current_cigar.last() {
-            if self.skip_clipped_bases && matches!(c, Cigar::SoftClip(_) | Cigar::HardClip(_)) {
-                // Safe to unwrap because checked Some above
-                trailing_clipped_bases += current_cigar.pop().unwrap().len();
-            } else {
-                break;
+        // Handle trailing clipped bases
+        if self.skip_clipped_bases {
+            if rec.cigar().trailing_hardclips() > 0 {
+                current_cigar.pop();
+            }
+            let trailing_softclips = rec.cigar().trailing_softclips() as usize;
+            if trailing_softclips > 0 {
+                current_cigar.pop();
             }
         }
 
         let mut cigar_iter = current_cigar.into_iter();
 
-        // Check for starting clipped bases
-        if let Some(c) = cigar_iter.next() {
-            cigar_consumption = Self::consume_cigar(c, self.chunk_size - local_query_consumed);
-            if self.skip_clipped_bases && matches!(cigar_consumption.left_c, Cigar::SoftClip(_) | Cigar::HardClip(_)) {
-                global_query_offset += cigar_consumption.query_offset;  // Ref offset does not change here
-            } else {
-                cigar_string.push(cigar_consumption.left_c);
-                local_ref_consumed += cigar_consumption.ref_offset;
-                local_query_consumed += cigar_consumption.query_offset;
-
-                if cigar_consumption.right_c.is_none() {
-                    // Fully consumed cigar token
-                    if local_query_consumed == self.chunk_size {
-                        // Add record if filled chunk_size
-                        self.add_chunk_record(rec, &cigar_string, global_ref_offset, global_query_offset as usize, trailing_clipped_bases, false);
-
-                        // Update global offsets after adding records
-                        global_ref_offset += local_ref_consumed;
-                        global_query_offset += local_query_consumed;
-
-                        // Restart new consumption cycle
-                        cigar_string.clear();
-                        local_ref_consumed = 0;
-                        local_query_consumed = 0;
-                    }
-                } else {
-                    // Finish consuming any Cigar in the buffer from previous iteration
-                    while let Some(c_buf) = cigar_consumption.right_c {
-                        // Partially consumed cigar, so must be time to write new record chunk
-                        self.add_chunk_record(rec, &cigar_string, global_ref_offset, global_query_offset as usize, trailing_clipped_bases, false);
-
-                        // Update global offsets after adding records
-                        global_ref_offset += local_ref_consumed;
-                        global_query_offset += local_query_consumed;
-
-                        // Restart new consumption cycle
-                        cigar_string.clear();
-                        local_ref_consumed = 0;
-                        local_query_consumed = 0;
-
-                        cigar_consumption = Self::consume_cigar(&c_buf, self.chunk_size - local_query_consumed);
-                        cigar_string.push(cigar_consumption.left_c);
-                        local_ref_consumed += cigar_consumption.ref_offset;
-                        local_query_consumed += cigar_consumption.query_offset;
-                    }
-                }
+        // Handle starting clipped bases
+        if self.skip_clipped_bases {
+            if rec.cigar().leading_hardclips() > 0 {
+                cigar_iter.next();
+            }
+            let leading_softclips = rec.cigar().leading_softclips() as usize;
+            if leading_softclips > 0 {
+                cigar_iter.next();
+                self.record_slice_meta_buffer.global_query_offset += leading_softclips;
             }
         }
 
         for c in cigar_iter {
             cigar_consumption = Self::consume_cigar(c, self.chunk_size - local_query_consumed);
-            cigar_string.push(cigar_consumption.left_c);
+            self.record_slice_meta_buffer.cigar_string.push(cigar_consumption.left_c);
             local_ref_consumed += cigar_consumption.ref_offset;
             local_query_consumed += cigar_consumption.query_offset;
 
@@ -229,14 +212,14 @@ impl AlignmentChopper {
                 // Fully consumed cigar token
                 if local_query_consumed == self.chunk_size {
                     // Add record if filled chunk_size
-                    self.add_chunk_record(rec, &cigar_string, global_ref_offset, global_query_offset as usize, trailing_clipped_bases, false);
+                    self.add_chunk_record(rec, local_query_consumed as usize);
 
                     // Update global offsets after adding records
-                    global_ref_offset += local_ref_consumed;
-                    global_query_offset += local_query_consumed;
+                    self.record_slice_meta_buffer.global_ref_offset += local_ref_consumed;
+                    self.record_slice_meta_buffer.global_query_offset += local_query_consumed as usize;
 
                     // Restart new consumption cycle
-                    cigar_string.clear();
+                    self.record_slice_meta_buffer.cigar_string.clear();
                     local_ref_consumed = 0;
                     local_query_consumed = 0;
                 }
@@ -244,19 +227,19 @@ impl AlignmentChopper {
                 // Finish consuming any Cigar in the buffer from previous iteration
                 while let Some(c_buf) = cigar_consumption.right_c {
                     // Partially consumed cigar, so must be time to write new record chunk
-                    self.add_chunk_record(rec, &cigar_string, global_ref_offset, global_query_offset as usize, trailing_clipped_bases, false);
+                    self.add_chunk_record(rec, local_query_consumed as usize);
 
                     // Update global offsets after adding records
-                    global_ref_offset += local_ref_consumed;
-                    global_query_offset += local_query_consumed;
+                    self.record_slice_meta_buffer.global_ref_offset += local_ref_consumed;
+                    self.record_slice_meta_buffer.global_query_offset += local_query_consumed as usize;
 
                     // Restart new consumption cycle
-                    cigar_string.clear();
+                    self.record_slice_meta_buffer.cigar_string.clear();
                     local_ref_consumed = 0;
                     local_query_consumed = 0;
 
                     cigar_consumption = Self::consume_cigar(&c_buf, self.chunk_size - local_query_consumed);
-                    cigar_string.push(cigar_consumption.left_c);
+                    self.record_slice_meta_buffer.cigar_string.push(cigar_consumption.left_c);
                     local_ref_consumed += cigar_consumption.ref_offset;
                     local_query_consumed += cigar_consumption.query_offset;
                 }
@@ -265,7 +248,7 @@ impl AlignmentChopper {
 
         // Handle min length requirement for last chunk
         if local_query_consumed >= self.min_length {
-            self.add_chunk_record(rec, &cigar_string, global_ref_offset, global_query_offset as usize, trailing_clipped_bases, true);
+            self.add_chunk_record(rec, local_query_consumed as usize);
         }
 
         &self.rec_pieces_buffer
@@ -275,9 +258,6 @@ impl AlignmentChopper {
 
 #[cfg(test)]
 mod tests {
-    use rust_htslib::bam::{Format, Read};
-    use rust_htslib::bam as hts_bam;
-
     use super::*;
 
     fn make_record(qname: &str, seq: &str, base_quals: &str, cigar: &CigarString, pos: i64) -> Record {
@@ -348,15 +328,11 @@ mod tests {
         let rec3 = make_record("test-2", "T", "3", &cigar3, 111);
 
         assert_eq!(chopper_skip_softclips_no_edges.chop_read(&rec), &vec![rec1.clone(), rec2.clone()]);
-
-        // let mut hts_reader = hts_bam::Reader::from_path("ilmn_10x.bam").unwrap();
-        // let mut header = hts_bam::header::Header::from_template(hts_reader.header());
-        //
-        // let mut hts_writer = hts_bam::Writer::from_path("test_out.bam", &header, Format::Bam).unwrap();
-        //
-        // let test_rec = &chopper_skip_softclips_with_edges.chop_read(&rec)[2];
-        // hts_writer.write(test_rec);
-        // hts_writer.write(&rec3);
         assert_eq!(chopper_skip_softclips_with_edges.chop_read(&rec), &vec![rec1, rec2, rec3]);
+    }
+
+    #[test]
+    fn large_clips_test() {
+
     }
 }
