@@ -33,9 +33,9 @@ struct Cli {
     #[arg(long, default_value_t=0)]
     min_length: u32,
 
-    /// Toggle whether to skip softclipped bases at edges of record
-    #[arg(long, default_value_t=true)]
-    skip_clipped_bases: bool,
+    // /// Toggle whether to skip softclipped bases at edges of record
+    // #[arg(long, default_value_t=true)]
+    // skip_clipped_bases: bool,
 
     /// Read group value to use for new split records
     #[arg(short='g', long)]
