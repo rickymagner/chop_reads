@@ -2,7 +2,7 @@ use std::cmp::min;
 use rust_htslib::bam::{Record};
 use rust_htslib::bam::record::{CigarString, Cigar, Aux};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AlignmentChopper {
     chunk_size: u32,
     min_length: u32,
@@ -32,7 +32,7 @@ impl SplitCigarBuf {
 }
 
 // A struct to hold metadata about current record slicing process
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct RecordSliceMetaBuffer {
     global_ref_offset: i64,
     global_query_offset: usize,

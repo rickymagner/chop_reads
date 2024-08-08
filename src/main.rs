@@ -1,15 +1,15 @@
 use std::path::PathBuf;
+use std::sync::Mutex;
+use rayon::prelude::*;
+use std::sync::mpsc::sync_channel;
 use rust_htslib::bam as hts_bam;
 use rust_htslib::bam::{Format, Read};
 use std::time::Instant;
 use clap::Parser;
+use rayon::iter::{IntoParallelIterator, ParallelBridge, ParallelIterator};
 use rust_htslib::bam::header::HeaderRecord;
 use chop_reads::alignment_chopper::AlignmentChopper;
 
-// Flags to add for CLI:
-// Later functionality:
-// --pair toggle making paired reads
-// --insert-size 0 (how far to space apart chunks)
 
 #[derive(Parser, Debug)]
 struct Cli {
@@ -34,7 +34,6 @@ struct Cli {
     min_length: u32,
 
     /// Toggle whether to skip softclipped bases at edges of record
-    /// WARNING: not implemented yet
     #[arg(long, default_value_t=true)]
     skip_clipped_bases: bool,
 
@@ -45,6 +44,10 @@ struct Cli {
     /// Sample name to use for new read group
     #[arg(short='n', long, requires("read_group"))]
     sample_name: Option<String>,
+
+    /// Number of threads to use
+    // #[arg(short, long, default_value_t=1)]
+    // threads: u32,
 }
 
 fn main() {
@@ -67,11 +70,7 @@ fn main() {
 
     let mut hts_writer = hts_bam::Writer::from_path(args.output, &header, Format::Bam).unwrap();
 
-    let mut alignment_chopper = AlignmentChopper::new(args.chunk_size, args.min_length, args.skip_clipped_bases, args.read_group);
-
-    // for rec in hts_reader.records() {
-    //
-    // }
+    let mut alignment_chopper = AlignmentChopper::new(args.chunk_size, args.min_length, args.skip_clipped_bases, args.read_group.clone());
 
     let mut record = hts_bam::Record::new();
     while let Some(r) = hts_reader.read(&mut record) {
@@ -81,6 +80,5 @@ fn main() {
         }
     }
 
-    println!("Time: {}s", now.elapsed().as_secs());
-
+    println!("Runtime: {}s", now.elapsed().as_secs());
 }
